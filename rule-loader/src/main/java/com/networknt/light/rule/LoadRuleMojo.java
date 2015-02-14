@@ -43,8 +43,8 @@ import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
 
 /**
- * Goal load java source code from the project source to orientdb. It checks if the
- * class implements com.networknt.light.rule.Rule interface.
+ * Goal load java source code from the project source to Light Server through REST API impRule. It checks if the
+ * class implements com.networknt.light.rule.Rule interface and if source code has been changed.
  *
  * @goal load
  *
@@ -54,11 +54,11 @@ import org.apache.maven.plugin.MojoExecutionException;
 public class LoadRuleMojo extends AbstractMojo {
     ObjectMapper mapper = new ObjectMapper();
     CloseableHttpClient httpclient = null;
+    Map<String, String> ruleMap = null;
     String jwt = null;
 
     private final List<String> files = new ArrayList<String>(10000);
     private String sqlString = "";
-    private String dbUrl = "";
 
     /**
      * Location of the file.
@@ -95,39 +95,6 @@ public class LoadRuleMojo extends AbstractMojo {
      *
      */
     private String encoding;
-
-    /**
-     * type of database
-     *
-     * @parameter default-value = "orientdb"
-     * @required
-     *
-     */
-    private String dbType;
-
-    /**
-     * name of database
-     *
-     * @parameter default-value="ruledb"
-     * @required
-     */
-    private String dbName;
-
-    /**
-     * user of database
-     *
-     * @parameter default-value="admin"
-     * @required
-     */
-    private String dbUser;
-
-    /**
-     * pass of database
-     *
-     * @parameter default-value="admin"
-     * @required
-     */
-    private String dbPass;
 
     /**
      * server url
@@ -172,28 +139,23 @@ public class LoadRuleMojo extends AbstractMojo {
             getLog().error("Source directory \"" + sourceDirectory + "\" is not valid.");
             return;
         }
-        // ensure db exists.
-        dbUrl = "plocal:"+ System.getProperty("user.home") + "/" + dbName;
-        System.out.println("dbUrl = " + dbUrl);
-        ODatabaseDocumentTx db = new ODatabaseDocumentTx(dbUrl);
-        if(!db.exists()) {
-            db.create();
-            initRule(db);
-        }
 
         httpclient = HttpClients.createDefault();
 
         login();
 
+        // get ruleClass and sourceCode map from the server in order to compare.
+        ruleMap = getRuleMap();
+
         fillListWithAllFilesRecursiveTask(sourceDirectory, files);
-        fillListWithAllFilesRecursiveTask(testSourceDirectory, files);
+        //fillListWithAllFilesRecursiveTask(testSourceDirectory, files);
 
         for (final String filePath : files) {
-            // load rule file into db
+            // load rule file and import to Light Server
             parseRuleFile(filePath);
         }
 
-
+        // write a sql out put file in case you are using the rule engine with SQL database.
         writeSqlToOutputFile();
 
         if (httpclient != null) {
@@ -203,7 +165,6 @@ public class LoadRuleMojo extends AbstractMojo {
                 e.printStackTrace();
             }
         }
-
     }
 
     private boolean ensureTargetDirectoryExists() {
@@ -224,7 +185,6 @@ public class LoadRuleMojo extends AbstractMojo {
             if (".java".equals(getExtension(file))) {
                 final Scanner scan = new Scanner(file, encoding);
                 String line = scan.nextLine();
-                System.out.println(line);
                 while (scan.hasNext()) {
                     if (!line.trim().isEmpty()) {
                         if (line.startsWith("package")) {
@@ -242,14 +202,17 @@ public class LoadRuleMojo extends AbstractMojo {
                 sourceCode.append("\n");
             }
             if (validRule) {
-                // connect to localhost:8080 to upload rule here.
+                // connect to example:8080 to upload rule here.
                 String ruleClass = packageName + "." + className;
 
-                impServer(ruleClass, sourceCode.toString());
-                // generate SQL insert statements
+                // only import the rule if source has been changed after comparing with server
+                if(!sourceCode.toString().equals(ruleMap.get(ruleClass))) {
+                    impRule(ruleClass, sourceCode.toString());
+                    // generate SQL insert statements
 
-                String sql = "INSERT INTO RULE(class_name, source_code) VALUES ('" + ruleClass + "', '" + sourceCode.toString().replaceAll("'", "''") + "');\n";
-                sqlString += sql;
+                    String sql = "INSERT INTO RULE(class_name, source_code) VALUES ('" + ruleClass + "', '" + sourceCode.toString().replaceAll("'", "''") + "');\n";
+                    sqlString += sql;
+                }
             }
         } catch (final IOException e) {
             getLog().error(e.getMessage());
@@ -276,8 +239,6 @@ public class LoadRuleMojo extends AbstractMojo {
             input.setContentType("application/json");
             httpPost.setEntity(input);
             response = httpclient.execute(httpPost);
-
-            System.out.println(response.getStatusLine());
             HttpEntity entity = response.getEntity();
             BufferedReader rd = new BufferedReader(new InputStreamReader(entity.getContent()));
             String json = "";
@@ -285,12 +246,12 @@ public class LoadRuleMojo extends AbstractMojo {
             while ((line = rd.readLine()) != null) {
                 json = json + line;
             }
-            System.out.println("json = " + json);
             Map<String, Object> jsonMap = mapper.readValue(json,
                     new TypeReference<HashMap<String, Object>>() {
                     });
             jwt = (String)jsonMap.get("accessToken");
             EntityUtils.consume(entity);
+            System.out.println("Logged in successfully");
         } catch (Exception e) {
             e.printStackTrace();
         } finally {
@@ -303,7 +264,56 @@ public class LoadRuleMojo extends AbstractMojo {
             }
         }
     }
-    private void impServer(String ruleClass, String sourceCode) {
+
+    /**
+     * Get all rules from the server and construct a map in order to compare source code
+     * to detect changes or not.
+     *
+     * @return Map<String, String>
+     */
+    private Map<String, String> getRuleMap() {
+        Map<String, String> ruleMap = null;
+
+        Map<String, Object> inputMap = new HashMap<String, Object>();
+        inputMap.put("category", "rule");
+        inputMap.put("name", "getRuleMap");
+        inputMap.put("readOnly", true);
+
+        CloseableHttpResponse response = null;
+        try {
+            HttpPost httpPost = new HttpPost(serverUrl + "/api/rs");
+            httpPost.addHeader("Authorization", "Bearer " + jwt);
+            StringEntity input = new StringEntity(mapper.writeValueAsString(inputMap));
+            input.setContentType("application/json");
+            httpPost.setEntity(input);
+            response = httpclient.execute(httpPost);
+            HttpEntity entity = response.getEntity();
+            BufferedReader rd = new BufferedReader(new InputStreamReader(entity.getContent()));
+            String json = "";
+            String line = "";
+            while ((line = rd.readLine()) != null) {
+                json = json + line;
+            }
+            EntityUtils.consume(entity);
+            System.out.println("Got rule map from server");
+            ruleMap = mapper.readValue(json,
+                    new TypeReference<HashMap<String, String>>() {
+                    });
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            if (response != null) {
+                try {
+                    response.close();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+        return ruleMap;
+    }
+
+    private void impRule(String ruleClass, String sourceCode) {
 
         Map<String, Object> inputMap = new HashMap<String, Object>();
         inputMap.put("category", "rule");
@@ -329,8 +339,8 @@ public class LoadRuleMojo extends AbstractMojo {
             while ((line = rd.readLine()) != null) {
                 json = json + line;
             }
-            System.out.println("json = " + json);
             EntityUtils.consume(entity);
+            System.out.println("Loaded " + ruleClass);
         } catch (Exception e) {
             e.printStackTrace();
         } finally {
@@ -341,32 +351,6 @@ public class LoadRuleMojo extends AbstractMojo {
                     e.printStackTrace();
                 }
             }
-        }
-    }
-
-    private void impDb(String ruleClass, String sourceCode) throws Exception {
-
-        ODatabaseDocumentTx db = ODatabaseDocumentPool.global().acquire(dbUrl, dbUser, dbPass);
-        OSchema schema = db.getMetadata().getSchema();
-        try {
-            db.begin();
-            // remove the document for the class if there are any.
-            OSQLSynchQuery<ODocument> query = new OSQLSynchQuery<ODocument>("select from Rule where ruleClass = ?");
-
-            List<ODocument> result = db.command(query).execute(ruleClass);
-            for (ODocument rule : result) {
-                rule.delete();
-            }
-            ODocument doc = new ODocument(schema.getClass("Rule"));
-            doc.field("ruleClass", ruleClass);
-            doc.field("sourceCode", sourceCode);
-            doc.save();
-            db.commit();
-        } catch (Exception e) {
-            db.rollback();
-            e.printStackTrace();
-        } finally {
-            db.close();
         }
     }
 
@@ -430,20 +414,4 @@ public class LoadRuleMojo extends AbstractMojo {
             return filename.substring(dotPos);
         }
     }
-
-    private static void initRule(ODatabaseDocumentTx db) {
-        try {
-            OSchema schema = db.getMetadata().getSchema();
-            OClass rule = schema.createClass("Rule");
-            rule.createProperty("ruleClass", OType.STRING);
-            rule.createProperty("sourceCode", OType.STRING);
-            schema.save();
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            db.close();
-        }
-    }
-
-
 }
